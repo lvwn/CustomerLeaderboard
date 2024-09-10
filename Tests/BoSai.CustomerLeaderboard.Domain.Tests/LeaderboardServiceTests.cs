@@ -157,20 +157,25 @@ namespace BoSai.CustomerLeaderboard.Domain.Tests
         public void GetCustomerAndNeighbors_ValidCustomer_ShouldReturnCorrectNeighbors()
         {
             // Arrange
-            _leaderboardService.UpdateScore(1, 500);
-            _leaderboardService.UpdateScore(2, 400);
-            _leaderboardService.UpdateScore(3, 300);
-            _leaderboardService.UpdateScore(4, 200);
-            _leaderboardService.UpdateScore(5, 100);
+            _leaderboardService.UpdateScore(1, 102);
+            _leaderboardService.UpdateScore(2, 103);
+            _leaderboardService.UpdateScore(3, 99);
+            _leaderboardService.UpdateScore(4, 98);
+            _leaderboardService.UpdateScore(5, 97);
+            _leaderboardService.UpdateScore(6, -1);
+            _leaderboardService.UpdateScore(7, -101);
 
             // Act
-            var neighbors = _leaderboardService.GetCustomerAndNeighbors(3, 1, 1);
+            var neighbors = _leaderboardService.GetCustomerAndNeighbors(4, 2, 2);
 
             // Assert
-            Assert.Equal(3, neighbors.Count);
-            Assert.Equal(2, neighbors[0].CustomerId); // Higher neighbor
-            Assert.Equal(3, neighbors[1].CustomerId); // The target customer
-            Assert.Equal(4, neighbors[2].CustomerId); // Lower neighbor
+            Assert.Equal(4, neighbors.Count);// 客户6与客户7不参与排名
+            Assert.Equal(1, neighbors[0].CustomerId); // 客户1是一个元素
+            Assert.Equal(102, neighbors[0].Score); // 客户1的得分是102
+            Assert.Equal(2, neighbors[0].Rank); // 客户2的排名为2
+            Assert.Equal(5, neighbors[3].CustomerId); // 第4个元素是客户5
+            Assert.Equal(97, neighbors[3].Score); // 第4个元素是客户5
+            Assert.Equal(5, neighbors[3].Rank); // 第4个元素的排名是5
         }
 
         /// <summary>

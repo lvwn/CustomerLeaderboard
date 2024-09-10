@@ -2,6 +2,7 @@
 using BoSai.CustomerLeaderboard.Domain.Models;
 using BoSai.CustomerLeaderboard.Shared.DTOs;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 
 namespace BoSai.CustomerLeaderboard.Domain.Services
 {
@@ -10,13 +11,21 @@ namespace BoSai.CustomerLeaderboard.Domain.Services
     /// </summary>
     public class LeaderboardService : ILeaderboardService
     {
-        /// <summary>
-        /// 使用并发字典来存储客户数据（CustomerId -> Customer）
-        /// </summary>
+        // 使用ConcurrentDictionary来存储客户信息，确保线程安全
         private readonly ConcurrentDictionary<long, Customer> _customers = new();
 
-        // 使用SortedList按分数和CustomerID排序，分数降序排列（双键排序：-Score -> CustomerId）
-        private readonly SortedList<(decimal negativeScore, long customerId), Customer> _sortedCustomers = new();
+        // 定义分片大小，假设每个分片包含100分数区间
+        private const int ShardSize = 100;
+
+        // 使用多个分片存储sortedCustomers，每个分片用SortedDictionary存储
+        private readonly SortedDictionary<int, SortedDictionary<(decimal, long), Customer>> _shardedCustomers
+            = new();
+
+        // Helper method: 根据分数确定分片
+        private int GetShardIndex(decimal score)
+        {
+            return (int)(-score / ShardSize);
+        }
 
         /// <summary>
         /// 锁用于保证多线程环境下的操作安全
@@ -31,44 +40,87 @@ namespace BoSai.CustomerLeaderboard.Domain.Services
         /// <returns>更新之后的分数</returns>
         public decimal UpdateScore(long customerId, decimal scoreChange)
         {
-            if (customerId < 0)
-            {
-                throw new ArgumentOutOfRangeException(nameof(scoreChange));
-            }
-            if (scoreChange > 1000 || scoreChange < -1000)
-            {
-                throw new ArgumentOutOfRangeException(nameof(scoreChange));
-            }
-            Customer customer;
             lock (_lock)
             {
-#pragma warning disable CS8600 // 将 null 字面量或可能为 null 的值转换为非 null 类型。
-                if (_customers.TryGetValue(customerId, out customer))
+                // Validate score change within the range
+                if (scoreChange < -1000 || scoreChange > 1000)
                 {
-                    // 从有序列表中删除旧的客户记录，使用负数分数来保持降序排列
-                    if (_sortedCustomers.ContainsKey((-customer.Score, customer.CustomerId)))
+                    throw new ArgumentOutOfRangeException(nameof(scoreChange), "Score change must be within the range [-1000, 1000].");
+                }
+
+                // 查找或者创建客户
+                var customer = _customers.GetOrAdd(customerId, id =>
+                {
+                    var tempCustomer = new Customer();
+                    tempCustomer.SetCustomerId(customerId);
+                    return tempCustomer;
+                });
+
+                decimal previousScore = customer.Score;
+
+                customer.ScoreChange(scoreChange);
+
+                int oldShardIndex = GetShardIndex(previousScore);
+
+                int newShardIndex = GetShardIndex(customer.Score);
+
+                // 如果客户分数发生了变化，需要更新分片
+                if (oldShardIndex != newShardIndex)
+                {
+                    // 从旧分片中移除客户
+                    if (_shardedCustomers.ContainsKey(oldShardIndex))
                     {
-                        _sortedCustomers.Remove((-customer.Score, customer.CustomerId));
+                        var oldShard = _shardedCustomers[oldShardIndex];
+                        oldShard.Remove((-previousScore, customerId));
                     }
-                    customer.ScoreChange(scoreChange); // 更新现有客户的分数
+                    if (customer.Score <= 0)
+                    {
+                        // 分数不大于0时不参与排名
+                        return customer.Score;
+                    }
+                    SortedDictionary<(decimal, long), Customer>? newShard = null;
+                    // 查找或者创建新的片区
+                    if (_shardedCustomers.ContainsKey(newShardIndex))
+                    {
+                        newShard = _shardedCustomers[newShardIndex];
+                    }
+                    else
+                    {
+                        newShard = new SortedDictionary<(decimal, long), Customer>();
+                        _shardedCustomers.Add(newShardIndex, newShard);
+                    }
+
+                    newShard.Add((-customer.Score, customer.CustomerId), customer);
                 }
                 else
                 {
-                    // 添加新客户
-                    customer = new Customer();
-                    customer.SetCustomerId(customerId);
-                    customer.ScoreChange(scoreChange);
-                    _customers[customerId] = customer; // 添加新客户到排行榜
-                }
-#pragma warning restore CS8600 // 将 null 字面量或可能为 null 的值转换为非 null 类型。
 
-                // 将客户重新插入到有序列表中，使用负数分数来保持降序排列,只有分数大于0才参与排名
-                if (customer.Score > 0)
-                {
-                    _sortedCustomers.Add((-customer.Score, customer.CustomerId), customer);
+                    // 如果客户仍在同一个分片内，更新当前分片内的记录
+                    if (_shardedCustomers.ContainsKey(newShardIndex))
+                    {
+                        var shard = _shardedCustomers[newShardIndex];
+                        shard.Remove((-previousScore, customerId));
+                        if (customer.Score <= 0)
+                        {
+                            // 分数不大于0时不参与排名
+                            return customer.Score;
+                        }
+                        shard.Add((-customer.Score, customerId), customer);
+                    }
+                    else
+                    {
+                        if (customer.Score <= 0)
+                        {
+                            // 分数不大于0时不参与排名
+                            return customer.Score;
+                        }
+                        var newShard = new SortedDictionary<(decimal, long), Customer>();
+                        _shardedCustomers.Add(newShardIndex, newShard);
+                        newShard.Add((-customer.Score, customer.CustomerId), customer);
+                    }
                 }
+                return customer.Score;
             }
-            return customer.Score;
         }
 
         /// <summary>
@@ -84,22 +136,42 @@ namespace BoSai.CustomerLeaderboard.Domain.Services
             {
                 throw new ArgumentException();
             }
-            // 由于_sortedCustomers已经有序，可以直接通过索引获取指定范围的客户
-            return _sortedCustomers.Values
-                .Skip(start - 1)
-                .Take(end - start + 1)
-                .Select((customer, index) =>
+            List<CustomerDTO> result = new();
+            long currentRank = 0;
+            int totalShardCount = 0;
+            // 按照分片的顺序遍历所有分片，并确保是按分数降序排列
+            foreach (var shardKeyValuePair in _shardedCustomers)
+            {
+                totalShardCount += shardKeyValuePair.Value.Count();
+                if (totalShardCount >= start && totalShardCount <= end)
                 {
-                    // 添加排名信息
-                    var rank = start + index;
-                    return new CustomerDTO
+                    // 前面n个片区的客户总数大于等于起始排名，从该片区开始筛选数据
+                    foreach (var customerKeyValuePair in shardKeyValuePair.Value)
                     {
-                        CustomerId = customer.CustomerId,
-                        Score = customer.Score,
-                        Rank = rank
-                    };
-                })
-                .ToList();
+                        currentRank += 1;
+                        if (currentRank >= start && currentRank <= end)
+                        {
+                            result.Add(new CustomerDTO()
+                            {
+                                CustomerId = customerKeyValuePair.Value.CustomerId,
+                                Score = customerKeyValuePair.Value.Score,
+                                Rank = currentRank
+                            });
+                        }
+                    }
+                }
+                else
+                {
+                    // 不在排名范围内的片区，不进行数据遍历，只取总数。
+                    currentRank += shardKeyValuePair.Value.Count();
+                }
+                // 已获取全部排名，停止遍历数据
+                if (currentRank >= end)
+                {
+                    break;
+                }
+            }
+            return result;
         }
 
         /// <summary>
@@ -116,33 +188,179 @@ namespace BoSai.CustomerLeaderboard.Domain.Services
             {
                 throw new ArgumentOutOfRangeException(nameof(customerId));
             }
-            if (!_customers.ContainsKey(customerId))
+            List<CustomerDTO> result = new();
+            if (_customers.TryGetValue(customerId, out var targetCustomer))
             {
-                return new List<CustomerDTO>();
+                if (targetCustomer.Score < 0)
+                {
+                    // 分数小于0是不参与排名
+                    return result;
+                }
+
+                // 获取目标客户所在分片的索引
+                int targetShardIndex = GetShardIndex(targetCustomer.Score);
+
+                // 获取目标客户以前片区的客户总量
+                long preShardCustomerCount = 0;
+                foreach (var preShard in _shardedCustomers.Where(c => c.Key < targetShardIndex))
+                {
+                    preShardCustomerCount += preShard.Value.Count;
+                }
+
+                var targetShard = _shardedCustomers[targetShardIndex];
+
+                // 获取目标客户在当前分数片区的排名
+                long currentShardRank = targetShard.Count(c => c.Key.Item1 * -1 > targetCustomer.Score ||// 分数小于当前客户
+                                                             c.Key.Item1 * -1 == targetCustomer.Score && c.Key.Item2 < targetCustomer.CustomerId) + 1;// 分数等于当前客户但客户ID小于当前客户
+
+                // 当前用户排名 = 当前用户所在分数片区之前所有片区的用户总数 + 用户在当前片区的排名
+                long targetCustomerRank = preShardCustomerCount + currentShardRank;
+
+                var sortedCustomer = new SortedDictionary<long, CustomerDTO>();
+
+                // 添加当前用户
+                sortedCustomer.Add(targetCustomerRank, new CustomerDTO()
+                {
+                    CustomerId = targetCustomer.CustomerId,
+                    Score = targetCustomer.Score,
+                    Rank = targetCustomerRank
+                });
+
+                // 添加排名在当前用户前high位邻居
+                int addedHigherCount = 0;
+                // 取当前片区排名在前的邻居
+
+                var reversedHigherRankShard = targetShard.Where(c => c.Key.Item1 * -1 > targetCustomer.Score ||
+                                                          (c.Key.Item1 * -1 == targetCustomer.Score && c.Key.Item2 < targetCustomer.CustomerId)).Reverse();
+                foreach (var customerKeyValuePair in reversedHigherRankShard)
+                {
+                    if (addedHigherCount >= high)
+                    {
+                        break;
+                    }
+
+                    addedHigherCount += 1;
+                    var neighborRank = targetCustomerRank - addedHigherCount;
+                    var neighbor = customerKeyValuePair.Value;
+
+                    sortedCustomer.Add(neighborRank, new CustomerDTO()
+                    {
+                        CustomerId = neighbor.CustomerId,
+                        Score = neighbor.Score,
+                        Rank = neighborRank
+                    });
+                }
+
+                // 当前用户片区未找到足够的排名在客户前面的邻居，从前面的片区继续查找。
+                if (addedHigherCount < high)
+                {
+                    var reversedSorted = _shardedCustomers.Where(c => c.Key < targetShardIndex).Reverse();
+                    foreach (var shardKeyValuePair in reversedSorted)
+                    {
+                        var shard = shardKeyValuePair.Value;
+                        addedHigherCount = AddHigherRankNeighbor(high, targetCustomerRank, sortedCustomer, addedHigherCount, shard);
+                        if (addedHigherCount >= high)
+                        {
+                            break;
+                        }
+                    }
+                }
+
+                //添加排名在当前用户后low位邻居
+                int addedLowerCount = 0;
+                var lowerRankShard = targetShard.Where(c => c.Key.Item1 * -1 < targetCustomer.Score ||
+                                          (c.Key.Item1 * -1 == targetCustomer.Score && c.Key.Item2 > targetCustomer.CustomerId));
+                foreach (var customerKeyValuePair in lowerRankShard)
+                {
+                    if (addedLowerCount >= high)
+                    {
+                        break;
+                    }
+                    var neighbor = customerKeyValuePair.Value;
+                    if (neighbor.Score < 0)
+                    {
+                        break;
+                    }
+                    addedLowerCount += 1;
+                    var neighborRank = targetCustomerRank + addedLowerCount;
+
+
+                    sortedCustomer.Add(neighborRank, new CustomerDTO()
+                    {
+                        CustomerId = neighbor.CustomerId,
+                        Score = neighbor.Score,
+                        Rank = neighborRank
+                    });
+                }
+                // 当前用户片区未找到足够的排名在客户后面的邻居，从后面的片区继续查找。
+                if (addedLowerCount < low)
+                {
+                    foreach (var shardKeyValuePair in _shardedCustomers.Where(c => c.Key > targetShardIndex))
+                    {
+                        var shard = shardKeyValuePair.Value;
+                        addedLowerCount = AddLowerRankNeighbor(low, targetCustomerRank, sortedCustomer, addedLowerCount, shard);
+                        if (addedHigherCount >= low)
+                        {
+                            break;
+                        }
+                    }
+                }
+                result = (from ctm in sortedCustomer select ctm.Value).ToList();
             }
 
-            // 查找客户的索引
-            var index = _sortedCustomers.IndexOfKey((-_customers[customerId].Score, customerId));
-            if (index == -1) return new List<CustomerDTO>();
+            return result; // 未找到客户
+        }
 
-            // 获取指定客户及其上方和下方的邻居
-            int start = index - high >= 0 ? index - high : 0;
-            int count = high + low + 1;
-            return _sortedCustomers.Values
-                .Skip(start)
-                .Take(count)
-                .Select((customer, idx) =>
+        private int AddHigherRankNeighbor(int high, long targetCustomerRank, SortedDictionary<long, CustomerDTO> sortedCustomer, int addedHigherCount, SortedDictionary<(decimal, long), Customer> shard)
+        {
+            foreach (var customerKeyValuePair in shard.Reverse())
+            {
+                if (addedHigherCount >= high)
                 {
-                    // 添加排名信息
-                    var rank = start + idx + 1; // 索引从0开始，排名从1开始
-                    return new CustomerDTO
-                    {
-                        CustomerId = customer.CustomerId,
-                        Score = customer.Score,
-                        Rank = rank
-                    };
-                })
-                .ToList();
+                    break;
+                }
+                var neighbor = customerKeyValuePair.Value;
+                addedHigherCount += 1;
+                var neighborRank = targetCustomerRank - addedHigherCount;
+                sortedCustomer.Add(neighborRank, new CustomerDTO()
+                {
+                    CustomerId = neighbor.CustomerId,
+                    Score = neighbor.Score,
+                    Rank = neighborRank
+                });
+            }
+
+            return addedHigherCount;
+        }
+
+        private int AddLowerRankNeighbor(int low, long currentShardRank, SortedDictionary<long, CustomerDTO> sortedCustomer, int addedLowerCount, SortedDictionary<(decimal, long), Customer> shard)
+        {
+            if (addedLowerCount >= low)
+            {
+                return addedLowerCount;
+            }
+            foreach (var customerKeyValuePair in shard)
+            {
+                if (addedLowerCount >= low)
+                {
+                    break;
+                }
+                var neighbor = customerKeyValuePair.Value;
+                if (neighbor.Score < 0)
+                {
+                    //分数小于0不参与排名
+                    break;
+                }
+                addedLowerCount += 1;
+                var neighborRank = currentShardRank + addedLowerCount;
+                sortedCustomer.Add(neighborRank, new CustomerDTO()
+                {
+                    CustomerId = neighbor.CustomerId,
+                    Score = neighbor.Score,
+                    Rank = neighborRank
+                });
+            }
+            return addedLowerCount;
         }
     }
 }
