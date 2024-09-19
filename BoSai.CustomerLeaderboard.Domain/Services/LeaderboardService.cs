@@ -21,7 +21,10 @@ namespace BoSai.CustomerLeaderboard.Domain.Services
         private readonly SortedDictionary<int, SortedDictionary<(decimal, long), Customer>> _shardedCustomers
             = new();
 
-        // Helper method: 根据分数确定分片
+        // 用来记录每个分片的起始和结束排名
+        private readonly Dictionary<int, (long StartRank, long EndRank)> _shardIndex = new();
+
+        // 根据分数确定分片
         private int GetShardIndex(decimal score)
         {
             return (int)(-score / ShardSize);
@@ -75,6 +78,8 @@ namespace BoSai.CustomerLeaderboard.Domain.Services
                     }
                     if (customer.Score <= 0)
                     {
+                        // 更新分片索引，确保索引信息是最新的
+                        UpdateShardIndex();
                         // 分数不大于0时不参与排名
                         return customer.Score;
                     }
@@ -102,6 +107,8 @@ namespace BoSai.CustomerLeaderboard.Domain.Services
                         shard.Remove((-previousScore, customerId));
                         if (customer.Score <= 0)
                         {
+                            // 更新分片索引，确保索引信息是最新的
+                            UpdateShardIndex();
                             // 分数不大于0时不参与排名
                             return customer.Score;
                         }
@@ -111,6 +118,8 @@ namespace BoSai.CustomerLeaderboard.Domain.Services
                     {
                         if (customer.Score <= 0)
                         {
+                            // 更新分片索引，确保索引信息是最新的
+                            UpdateShardIndex();
                             // 分数不大于0时不参与排名
                             return customer.Score;
                         }
@@ -119,9 +128,31 @@ namespace BoSai.CustomerLeaderboard.Domain.Services
                         newShard.Add((-customer.Score, customer.CustomerId), customer);
                     }
                 }
+
+                // 更新分片索引，确保索引信息是最新的
+                UpdateShardIndex();
                 return customer.Score;
             }
         }
+
+        /// <summary>
+        /// 更新分片索引，计算每个分片的起始和结束排名
+        /// </summary>
+        private void UpdateShardIndex()
+        {
+            _shardIndex.Clear();
+            long currentRank = 0;
+            foreach (var shardKeyValuePair in _shardedCustomers)
+            {
+                var shard = shardKeyValuePair.Value;
+                long shardStartRank = currentRank + 1;
+                long shardEndRank = shardStartRank + shard.Count - 1;
+                _shardIndex.Add(shardKeyValuePair.Key, (shardStartRank, shardEndRank));
+                currentRank = shardEndRank;
+            }
+        }
+
+
 
         /// <summary>
         /// 按排名范围获取客户
@@ -136,44 +167,70 @@ namespace BoSai.CustomerLeaderboard.Domain.Services
             {
                 throw new ArgumentException();
             }
+
+
             List<CustomerDTO> result = new();
-            long currentRank = 0;
-            int totalShardCount = 0;
-            // 按照分片的顺序遍历所有分片，并确保是按分数降序排列
-            foreach (var shardKeyValuePair in _shardedCustomers)
+
+            // 查找起始和结束排名对应的分片
+            var startShard = _shardIndex.FirstOrDefault(x => x.Value.EndRank >= start).Key;
+            var endShard = _shardIndex.LastOrDefault(x => x.Value.StartRank <= end).Key;
+
+            if (startShard == 0 || endShard == 0)
             {
-                totalShardCount += shardKeyValuePair.Value.Count();
-                if (totalShardCount >= start && totalShardCount <= end)
+                return result; // 没有找到对应的分片，返回空结果
+            }
+
+            // 开始遍历从 startShard 到 endShard 的分片
+            for (int shardIndex = startShard; shardIndex <= endShard; shardIndex++)
+            {
+                // 分片不存在，调过继续执行 
+                if (!_shardedCustomers.ContainsKey(shardIndex))
                 {
-                    // 前面n个片区的客户总数大于等于起始排名，从该片区开始筛选数据
-                    foreach (var customerKeyValuePair in shardKeyValuePair.Value)
+                    continue;
+                }
+                var shard = _shardedCustomers[shardIndex];
+                var (shardStartRank, shardEndRank) = _shardIndex[shardIndex];  // 解构获取 startRank 和 endRank
+
+                // 确定当前分片范围内的有效排名
+                long adjustedStart = Math.Max(shardStartRank, start); // 确定当前分片的起始点
+                long adjustedEnd = Math.Min(shardEndRank, end);       // 确定当前分片的结束点
+
+                // 遍历当前分片，保证 currentRank 是全局排名
+                long currentRank = shardStartRank;
+                foreach (var customerKeyValuePair in shard)
+                {
+                    if (currentRank >= adjustedStart && currentRank <= adjustedEnd)
                     {
-                        currentRank += 1;
-                        if (currentRank >= start && currentRank <= end)
+                        result.Add(new CustomerDTO()
                         {
-                            result.Add(new CustomerDTO()
-                            {
-                                CustomerId = customerKeyValuePair.Value.CustomerId,
-                                Score = customerKeyValuePair.Value.Score,
-                                Rank = currentRank
-                            });
-                        }
+                            CustomerId = customerKeyValuePair.Value.CustomerId,
+                            Score = customerKeyValuePair.Value.Score,
+                            Rank = currentRank // 使用全局排名
+                        });
                     }
-                }
-                else
-                {
-                    // 不在排名范围内的片区，不进行数据遍历，只取总数。
-                    currentRank += shardKeyValuePair.Value.Count();
-                }
-                // 已获取全部排名，停止遍历数据
-                if (currentRank >= end)
-                {
-                    break;
+
+                    currentRank++; // 更新全局排名
+
+                    if (currentRank > end)
+                    {
+                        return result; // 达到请求的结束排名，返回结果
+                    }
                 }
             }
             return result;
         }
 
+        /// <summary>
+        /// 按客户ID获取客户及其邻居
+        /// </summary>
+        /// <param name="customerId">客户id</param>
+        /// <param name="high">客户排名之前位数</param>
+        /// <param name="low">客户排名之后位数</param>
+        /// <returns>指定户客户及其邻居</returns>
+        /// <exception cref="ArgumentOutOfRangeException"></exception>
+        /// <summary>
+        /// 获取客户及其邻居，确保跨分片排名的准确性
+        /// </summary>
         /// <summary>
         /// 按客户ID获取客户及其邻居
         /// </summary>
