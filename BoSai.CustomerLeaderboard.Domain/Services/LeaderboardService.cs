@@ -228,17 +228,6 @@ namespace BoSai.CustomerLeaderboard.Domain.Services
         /// <param name="low">客户排名之后位数</param>
         /// <returns>指定户客户及其邻居</returns>
         /// <exception cref="ArgumentOutOfRangeException"></exception>
-        /// <summary>
-        /// 获取客户及其邻居，确保跨分片排名的准确性
-        /// </summary>
-        /// <summary>
-        /// 按客户ID获取客户及其邻居
-        /// </summary>
-        /// <param name="customerId">客户id</param>
-        /// <param name="high">客户排名之前位数</param>
-        /// <param name="low">客户排名之后位数</param>
-        /// <returns>指定户客户及其邻居</returns>
-        /// <exception cref="ArgumentOutOfRangeException"></exception>
         public List<CustomerDTO> GetCustomerAndNeighbors(long customerId, int high, int low)
         {
             if (customerId <= 0)
